@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Check if rg, fzf, and nvim are installed
+command -v rg >/dev/null 2>&1 || { echo "rg (ripgrep) is required but not installed."; exit 1; }
+command -v fzf >/dev/null 2>&1 || { echo "fzf is required but not installed."; exit 1; }
+command -v nvim >/dev/null 2>&1 || { echo "nvim (Neovim) is required but not installed."; exit 1; }
+command -v bat >/dev/null 2>&1 || { echo "bat is required but not installed."; exit 1; }
+
+# Run rg with optional search pattern (defaults to empty string)
+rg --color=always --line-number --no-heading --smart-case "${1:-}" \
+| fzf --ansi --delimiter : \
+      --preview 'bat --style=full --color=always --highlight-line {2} {1}' \
+      --preview-window '~4,+{2}+4/3,<80(up)' \
+      --bind 'enter:execute(nvim {1} +{2})'
