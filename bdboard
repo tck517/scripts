@@ -25,10 +25,9 @@
 #                             bead as delivered (default: committed,in-review)
 #   BDBOARD_REFRESH           auto-refresh seconds (default: 10, 0 disables)
 #   BDBOARD_WIDTH             pane width for --split (default: 45%)
-#   BDBOARD_GLOW_STYLE        glow style for the detail pane (default: built in)
 #
 # Requires bash, bd, jq, fzf 0.51+, curl, python3. Optional: claude (enter),
-# tmux, glow, mdfried.
+# tmux, mdfried or glow (to show explanations).
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/bdboard"
@@ -152,7 +151,10 @@ bead_markdown() {
     "\nUpdated \(($b.updated_at // "")[0:16] | sub("T"; " "))"
       + (if $b.closed_at then " · closed \($b.closed_at[0:10])" else "" end),
     (if ($b.close_reason // "") != "" then "\n> \($b.close_reason)" else empty end),
-    (if ($b.description // "") != "" then "\n## Description\n\n" + ($b.description | demote) else empty end),
+    # A description with its own headings (a ticket template) stands on its own.
+    (if ($b.description // "") == "" then empty
+     elif ($b.description | test("(?m)^#{1,6} ")) then "\n" + $b.description
+     else "\n## Description\n\n" + ($b.description | demote) end),
     (if ($b.acceptance_criteria // "") != "" then "\n## Acceptance criteria\n\n" + ($b.acceptance_criteria | demote) else empty end),
     (if ($b.design // "") != "" then "\n## Design\n\n" + ($b.design | demote) else empty end),
     (if deps($b.dependencies) != "" then "\n## Depends on\n\n" + deps($b.dependencies) else empty end),
@@ -161,40 +163,131 @@ bead_markdown() {
   '
 }
 
-# glow (glamour) theme for the detail pane: no '#' marks, coloured levels,
-# tight margins. Colours follow the mdfried theme.
-read -r -d '' GLOW_STYLE <<'JSON'
-{
-  "document": { "block_prefix": "", "block_suffix": "\n", "color": "252", "margin": 1 },
-  "paragraph": {},
-  "block_quote": { "indent": 1, "indent_token": "▌ ", "color": "245", "italic": true },
-  "list": { "level_indent": 2 },
-  "heading": { "block_suffix": "\n", "bold": true },
-  "h1": { "color": "111", "bold": true },
-  "h2": { "prefix": "▍", "color": "111", "bold": true },
-  "h3": { "color": "180", "bold": true },
-  "h4": { "color": "150", "bold": true },
-  "h5": { "color": "146" },
-  "h6": { "color": "146" },
-  "text": {},
-  "strong": { "bold": true, "color": "255" },
-  "emph": { "italic": true, "color": "250" },
-  "strikethrough": { "crossed_out": true },
-  "hr": { "color": "240", "format": "\n────────\n" },
-  "item": { "block_prefix": "• " },
-  "enumeration": { "block_prefix": ". " },
-  "task": { "ticked": "[✓] ", "unticked": "[ ] " },
-  "link": { "color": "39", "underline": true },
-  "link_text": { "color": "39", "bold": true },
-  "image": { "color": "212", "underline": true },
-  "image_text": { "color": "243", "format": "Image: {{.text}} →" },
-  "code": { "prefix": "", "suffix": "", "color": "217", "background_color": "236" },
-  "code_block": { "color": "244", "margin": 1, "chroma": {} },
-  "table": { "color": "252" },
-  "definition_list": {}, "definition_term": {}, "definition_description": { "block_prefix": "\n🠶 " },
-  "html_block": {}, "html_span": {}
-}
-JSON
+# Renders the detail pane: the markdown bdboard builds, wrapped to the pane
+# width, with coloured heading levels, checkboxes and inline code.
+read -r -d '' RENDER <<'PY'
+import re, sys
+W = max(20, int(sys.argv[1]) if len(sys.argv) > 1 else 80)
+E = lambda c: "\x1b[" + c + "m"
+R = E("0")
+TEXT, DIM, BOLD = E("38;5;252"), E("38;5;245"), E("1;38;5;255")
+CODE = E("38;5;217;48;5;236")
+HEAD = {1: E("1;38;5;111"), 2: E("1;38;5;111"), 3: E("1;38;5;180")}
+H_DEEP = E("1;38;5;150")
+
+def words(text):
+    """Split inline markdown into (word, style) pairs: **bold**, `code`, _dim_."""
+    out, bold, code = [], False, False
+    for tok in re.split(r"(\*\*|`)", text):
+        if tok == "**" and not code:
+            bold = not bold; continue
+        if tok == "`":
+            code = not code; continue
+        for i, w in enumerate(tok.split(" ")):
+            if i > 0:
+                out.append((None, None))  # a space
+            if w:
+                style = CODE if code else BOLD if bold else TEXT
+                m = re.fullmatch(r"_(.+)_", w) or re.fullmatch(r"_\((.+)\)_", w)
+                if m and not code:
+                    w, style = w.strip("_"), DIM
+                out.append((w, style))
+    # merge pieces not separated by a space (e.g. "**P1**," -> one word)
+    merged, cur = [], []
+    for w, s in out + [(None, None)]:
+        if w is None:
+            if cur: merged.append(cur); cur = []
+        else:
+            cur.append((w, s))
+    return merged
+
+def wrap_plain(text, width):
+    lines, line = [], ""
+    for w in text.split(" "):
+        if line and len(line) + 1 + len(w) > width:
+            lines.append(line); line = w
+        else:
+            line = (line + " " + w) if line else w
+    return lines + [line]
+
+def vis(s):
+    return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+
+def wrap(text, width, first="", rest=""):
+    lines, line, n = [], first, vis(first)
+    started = False
+    for word in words(text):
+        wl = sum(len(w) for w, _ in word)
+        if started and n + 1 + wl > width:
+            lines.append(line); line, n = rest, vis(rest); started = False
+        if started:
+            line += " "; n += 1
+        line += "".join(s + w + R for w, s in word); n += wl; started = True
+    lines.append(line)
+    return lines
+
+src = sys.stdin.read().split("\n")
+out, i, para = [], 0, []
+
+def flush():
+    global para
+    if para:
+        out.extend(wrap(" ".join(para), W)); out.append(""); para = []
+
+while i < len(src):
+    l = src[i]
+    if l.startswith("```"):
+        flush(); i += 1
+        while i < len(src) and not src[i].startswith("```"):
+            out.append("  " + DIM + src[i][: W - 2] + R); i += 1
+        out.append(""); i += 1; continue
+    m = re.match(r"^(#{1,6}) (.*)", l)
+    if m:
+        flush(); lvl = len(m.group(1))
+        style = HEAD.get(lvl, H_DEEP)
+        prefix = "▍" if lvl == 2 else ""
+        title = re.sub(r"[*`]", "", m.group(2))
+        out.extend(style + x + R for x in wrap_plain(prefix + title, W))
+        out.append(""); i += 1; continue
+    m = re.match(r"^(\s*)([-*]|\d+\.) (\[([ xX])\] )?(.*)", l)
+    if m:
+        flush()
+        indent = len(m.group(1)) // 2 * 2
+        mark = "☑ " if (m.group(4) or "").lower() == "x" else "☐ " if m.group(3) else \
+               (m.group(2) + " " if m.group(2)[0].isdigit() else "• ")
+        item = [m.group(5)]
+        while l.endswith("  ") or (i + 1 < len(src) and re.match(r"^\s{2,}\S", src[i + 1])
+                                   and not re.match(r"^\s*([-*]|\d+\.) ", src[i + 1])):
+            if i + 1 >= len(src): break
+            i += 1; l = src[i]; item.append("\n" + l.strip())
+        pad = " " * indent
+        first = True
+        for chunk in "".join(x if x.startswith("\n") else x for x in item).split("\n"):
+            chunk = chunk.strip()
+            if not chunk: continue
+            out.extend(wrap(chunk, W, pad + (DIM + mark + R if first else ""), pad + "  ")
+                       if first else wrap(chunk, W, pad + "  ", pad + "  "))
+            first = False
+        i += 1
+        if i < len(src) and src[i].strip() == "": out.append(""); i += 1
+        continue
+    if l.startswith(">"):
+        flush()
+        out.extend(DIM + "▌ " + R + x for x in wrap(l.lstrip("> "), W - 2)); i += 1; continue
+    if l.lstrip().startswith("|"):
+        flush(); out.append(TEXT + l[:W] + R); i += 1; continue
+    if re.fullmatch(r"\s*(-{3,}|\*{3,})\s*", l):
+        flush(); out.append(DIM + "─" * min(W, 40) + R); i += 1; continue
+    if l.strip() == "":
+        flush(); i += 1; continue
+    para.append(l.strip())
+    if l.endswith("  "):
+        out.extend(wrap(" ".join(para), W)); para = []
+    i += 1
+flush()
+while out and out[-1] == "": out.pop()
+print("\n".join(out))
+PY
 
 preview_bead() {
   local id="$1"
@@ -207,14 +300,9 @@ preview_bead() {
     return
   fi
   cd "$(project)" || return
-  local cols="${FZF_PREVIEW_COLUMNS:-80}" style="$BDBOARD_STATE/glow.json"
-  [ -s "$style" ] || printf '%s\n' "$GLOW_STYLE" > "$style"
-  if command -v glow >/dev/null 2>&1; then
-    bead_markdown "$id" | python3 -c "$PANE_FILTER" "$cols" keep-headings \
-      | glow -s "${BDBOARD_GLOW_STYLE:-$style}" -w "$((cols - 6))" -
-  else
-    bead_markdown "$id"
-  fi
+  local cols="${FZF_PREVIEW_COLUMNS:-80}"
+  bead_markdown "$id" | python3 -c "$PANE_FILTER" "$cols" keep-headings \
+    | python3 -c "$RENDER" "$((cols - 1))"
 }
 
 # Reshape markdown for a narrow pane: first heading becomes H1, the next level

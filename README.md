@@ -172,13 +172,12 @@ You can also type the path of any beads project into the picker. So the simplest
 | bash, `python3`, `curl` | The script itself (present on macOS and most Linux) |
 | [`bd`](https://github.com/steveyegge/beads), `jq` | Reading the tracker |
 | [`fzf`](https://github.com/junegunn/fzf) 0.51+ | The board |
-| [`glow`](https://github.com/charmbracelet/glow) | Formatting the detail pane (plain text without it) |
 | [`claude`](https://claude.com/claude-code) | Explanations (optional) |
 | tmux | `--split` and background explanations (optional) |
-| [`mdfried`](https://github.com/benjajaja/mdfried) | Showing explanations with large headings (optional; falls back to `glow`, then `less`) |
+| [`mdfried`](https://github.com/benjajaja/mdfried) or [`glow`](https://github.com/charmbracelet/glow) | Showing explanations (optional; mdfried draws large headings; falls back to `less`) |
 
 ```bash
-brew install jq fzf glow mdfried tmux
+brew install jq fzf mdfried tmux
 ```
 
 ### Settings
@@ -189,7 +188,6 @@ brew install jq fzf glow mdfried tmux
 | `BDBOARD_DELIVERED_LABELS` | `committed,in-review` | Labels that mark an in-progress bead as delivered |
 | `BDBOARD_REFRESH` | `10` | Seconds between refreshes; `0` turns refresh off |
 | `BDBOARD_WIDTH` | `45%` | Pane width for `--split` |
-| `BDBOARD_GLOW_STYLE` | built in | A glow style name or JSON file for the detail pane |
 
 ## License
 
