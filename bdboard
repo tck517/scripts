@@ -1,0 +1,528 @@
+#!/bin/bash
+#
+# bdboard - interactive beads (bd) board for a tmux pane
+#
+# Sections: UP NEXT (open, nothing blocking), IN PROCESS (claimed, not yet
+# delivered), DELIVERED (in progress with a delivered label, awaiting merge),
+# BLOCKED (open, waiting on another bead), DONE (closed).
+#
+# Keys: up/down move, type to filter, enter = plain-language explanation
+# (Claude, cached, full screen in mdfried), ctrl-e = regenerate explanation,
+# tab = detail mode (j/k, d/u, g/G scroll the detail pane; esc or tab back),
+# ctrl-d/ctrl-u = scroll detail, ctrl-p = switch project, ctrl-r = refresh now,
+# esc/ctrl-c = quit. The list auto-refreshes.
+#
+# Usage:
+#   bdboard                 board for the beads project containing $PWD (else pick one)
+#   bdboard -p <path>       board for <path>
+#   bdboard --pick          choose the project first
+#   bdboard --split [...]   open the board in a new tmux pane beside this one
+#
+# Env:
+#   BDBOARD_ROOTS             colon-separated dirs searched for projects
+#                             (default: ~/Projects ~/projects ~/src ~/code)
+#   BDBOARD_DELIVERED_LABELS  comma-separated labels that mark an in-progress
+#                             bead as delivered (default: committed,in-review)
+#   BDBOARD_REFRESH           auto-refresh seconds (default: 10, 0 disables)
+#   BDBOARD_WIDTH             pane width for --split (default: 45%)
+#   BDBOARD_GLOW_STYLE        glow style for the detail pane (default: built in)
+#
+# Requires bash, bd, jq, fzf 0.51+, curl, python3. Optional: claude (enter),
+# tmux, glow, mdfried.
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/bdboard"
+RECENT_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/bdboard/recent"
+
+die() { echo "bdboard: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- helpers
+
+project_file() { echo "$BDBOARD_STATE/project"; }
+project() { cat "$(project_file)"; }
+
+# Projects come from, in order: ones the board has opened before (most recent
+# first), then a scan of BDBOARD_ROOTS. A path typed into the picker also works.
+remember_project() {
+  mkdir -p "$(dirname "$RECENT_FILE")"
+  { echo "$1"; grep -vxF "$1" "$RECENT_FILE" 2>/dev/null; } | head -50 > "$RECENT_FILE.tmp" \
+    && mv "$RECENT_FILE.tmp" "$RECENT_FILE"
+}
+
+scan_projects() {
+  local IFS=:
+  for root in ${BDBOARD_ROOTS:-$HOME/Projects:$HOME/projects:$HOME/src:$HOME/code}; do
+    [ -d "$root" ] && find "$root" -maxdepth 4 -type d -name .beads \
+      -not -path '*/node_modules/*' 2>/dev/null
+  done | sed 's#/\.beads$##' | sort -uf
+}
+
+find_projects() {
+  { cat "$RECENT_FILE" 2>/dev/null; scan_projects; } \
+    | while read -r d; do [ -d "$d/.beads" ] && echo "$d"; done \
+    | awk '!seen[tolower($0)]++'
+}
+
+pick_project() {
+  local out query choice
+  out="$(find_projects | sed "s#^$HOME#~#" \
+    | fzf --layout=reverse --height=100% --prompt='project> ' --print-query \
+          --header='Pick a beads project, or type a path to one')"
+  query="$(printf '%s\n' "$out" | sed -n 1p)"
+  choice="$(printf '%s\n' "$out" | sed -n 2p)"
+  [ -z "$choice" ] && choice="$query"
+  choice="${choice/#\~/$HOME}"
+  [ -n "$choice" ] && [ -d "$choice/.beads" ] && (cd "$choice" && pwd)
+}
+
+detect_project() {
+  local dir
+  dir="$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null)" || dir="${1:-$PWD}"
+  [ -d "$dir/.beads" ] && echo "$dir"
+}
+
+header_text() { # [spinner frame]
+  local pending="" frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  printf '%s   enter explain  tab detail  ctrl-e regenerate  ctrl-p project  ctrl-r refresh' \
+    "$(project | sed "s#^$HOME#~#")"
+  [ -d "$BDBOARD_STATE/pending" ] && pending="$(ls "$BDBOARD_STATE/pending" | tr '\n' ' ')"
+  [ -n "$pending" ] && printf '\n  %s explaining %s' "${frames[$(( ${1:-0} % 10 ))]}" "$pending"
+}
+
+# ---------------------------------------------------------------- list
+
+list_beads() {
+  cd "$(project)" 2>/dev/null || { printf -- '-\tproject not found\n'; return; }
+  bd list --status all --limit 0 --json 2>/dev/null \
+    | jq -r --arg dl "${BDBOARD_DELIVERED_LABELS:-committed,in-review}" '
+    ($dl | split(",") | map(select(. != ""))) as $delivered_labels
+    | def c(code): "\u001b[" + code + "m";
+    def r: c("0");
+    def labels: (.labels // []);
+    def delivered: labels | any(. as $l | $delivered_labels | index($l));
+    def refs: labels | map(select(startswith("commit:") or startswith("pr:"))) | join(" ");
+    def kind: if .issue_type == "epic" then c("35") + "epic " + r else "" end;
+    def parent: if .parent then c("2") + "(" + .parent + ") " + r else "" end;
+    def row(extra): "\(.id)\t  " + c("1") + .id + r + "  " + c("2") + "P\(.priority)" + r
+      + "  " + kind + parent + .title + (if extra != "" then "  " + c("36") + extra + r else "" end);
+    def head(color; text; n): "-\t" + c("1;" + color) + "■ " + text + " (\(n))" + r;
+    def byprio: sort_by(.priority, .id);
+
+    # A blocker is cleared once it is closed or delivered (in workflows where
+    # delivered beads stay open until a larger merge, they should not block).
+    (map({key: .id, value: (.status == "closed" or delivered)}) | from_entries) as $cleared
+    | def waiting_on: [ (.dependencies // [])[]
+        | select(.type == "blocks" and ($cleared[.depends_on_id] | not)) | .depends_on_id ];
+    ([ .[] | select(.status == "open" and .issue_type != "epic") ]
+      | map(. + {waits: waiting_on}) | byprio) as $open
+    | ([ $open[] | select(.waits | length == 0) ]) as $next
+    | ([ $open[] | select(.waits | length > 0) ]) as $blocked
+    | ([ .[] | select(.status == "in_progress" and (delivered | not)) ] | byprio) as $wip
+    | ([ .[] | select(.status == "in_progress" and delivered) ] | byprio) as $dlv
+    | ([ .[] | select(.status == "closed") ] | sort_by(.closed_at // .updated_at) | reverse) as $done
+    | head("36"; "UP NEXT  ready to start"; ($next | length)),
+      ($next[] | row(labels | map(select(startswith("effort:"))) | join(" "))),
+      "-\t",
+      head("33"; "IN PROCESS"; ($wip | length)),
+      ($wip[] | row(.assignee // "")),
+      "-\t",
+      head("34"; "DELIVERED  awaiting merge"; ($dlv | length)),
+      ($dlv[] | row(refs)),
+      "-\t",
+      head("31"; "BLOCKED"; ($blocked | length)),
+      ($blocked[] | row("waits on " + (.waits | join(", ")))),
+      "-\t",
+      head("32"; "DONE"; ($done | length)),
+      ($done[] | row((.closed_at // "")[0:10]))
+  '
+}
+
+# ---------------------------------------------------------------- preview
+
+bead_markdown() {
+  bd show "$1" --json 2>/dev/null | jq -r '
+    (if type == "array" then .[0] else . end) as $b
+    | def demote: gsub("(?m)^(?<h>#+) "; "#\(.h) ") | gsub("(?m)^\\[(?<x>[ xX])\\] "; "- [\(.x)] ");
+      def deps(xs): (xs // []) | map("- `\(.status)` **\(.id)** \(.title) _(\(.dependency_type))_") | join("\n");
+    "# \($b.id) · \($b.title)\n",
+    "`\($b.status)` · **P\($b.priority)** · \($b.issue_type)"
+      + (if $b.parent then " · epic **\($b.parent)**" else "" end)
+      + (if $b.assignee then " · \($b.assignee)" else "" end),
+    (if ($b.labels // []) | length > 0 then "\n" + (($b.labels) | map("`\(.)`") | join(" ")) else empty end),
+    "\nUpdated \(($b.updated_at // "")[0:16] | sub("T"; " "))"
+      + (if $b.closed_at then " · closed \($b.closed_at[0:10])" else "" end),
+    (if ($b.close_reason // "") != "" then "\n> \($b.close_reason)" else empty end),
+    (if ($b.description // "") != "" then "\n## Description\n\n" + ($b.description | demote) else empty end),
+    (if ($b.acceptance_criteria // "") != "" then "\n## Acceptance criteria\n\n" + ($b.acceptance_criteria | demote) else empty end),
+    (if ($b.design // "") != "" then "\n## Design\n\n" + ($b.design | demote) else empty end),
+    (if deps($b.dependencies) != "" then "\n## Depends on\n\n" + deps($b.dependencies) else empty end),
+    (if deps($b.dependents) != "" then "\n## Unblocks\n\n" + deps($b.dependents) else empty end),
+    (if ($b.notes // "") != "" then "\n## Notes\n\n" + ($b.notes | split("\n") | map(select(. != "") | "- " + .) | join("\n")) else empty end)
+  '
+}
+
+# glow (glamour) theme for the detail pane: no '#' marks, coloured levels,
+# tight margins. Colours follow the mdfried theme.
+read -r -d '' GLOW_STYLE <<'JSON'
+{
+  "document": { "block_prefix": "", "block_suffix": "\n", "color": "252", "margin": 1 },
+  "paragraph": {},
+  "block_quote": { "indent": 1, "indent_token": "▌ ", "color": "245", "italic": true },
+  "list": { "level_indent": 2 },
+  "heading": { "block_suffix": "\n", "bold": true },
+  "h1": { "color": "111", "bold": true },
+  "h2": { "prefix": "▍", "color": "111", "bold": true },
+  "h3": { "color": "180", "bold": true },
+  "h4": { "color": "150", "bold": true },
+  "h5": { "color": "146" },
+  "h6": { "color": "146" },
+  "text": {},
+  "strong": { "bold": true, "color": "255" },
+  "emph": { "italic": true, "color": "250" },
+  "strikethrough": { "crossed_out": true },
+  "hr": { "color": "240", "format": "\n────────\n" },
+  "item": { "block_prefix": "• " },
+  "enumeration": { "block_prefix": ". " },
+  "task": { "ticked": "[✓] ", "unticked": "[ ] " },
+  "link": { "color": "39", "underline": true },
+  "link_text": { "color": "39", "bold": true },
+  "image": { "color": "212", "underline": true },
+  "image_text": { "color": "243", "format": "Image: {{.text}} →" },
+  "code": { "prefix": "", "suffix": "", "color": "217", "background_color": "236" },
+  "code_block": { "color": "244", "margin": 1, "chroma": {} },
+  "table": { "color": "252" },
+  "definition_list": {}, "definition_term": {}, "definition_description": { "block_prefix": "\n🠶 " },
+  "html_block": {}, "html_span": {}
+}
+JSON
+
+preview_bead() {
+  local id="$1"
+  if [ "$id" = "-" ] || [ -z "$id" ]; then
+    printf 'UP NEXT     open, nothing blocking it\n'
+    printf 'IN PROCESS  claimed and being worked, not yet delivered\n'
+    printf 'DELIVERED   in progress with a delivered label: %s\n' "${BDBOARD_DELIVERED_LABELS:-committed,in-review}"
+    printf 'BLOCKED     open, waiting on a bead that is not closed or delivered\n'
+    printf 'DONE        closed\n\nenter: plain-language explanation (full screen)\n'
+    return
+  fi
+  cd "$(project)" || return
+  local cols="${FZF_PREVIEW_COLUMNS:-80}" style="$BDBOARD_STATE/glow.json"
+  [ -s "$style" ] || printf '%s\n' "$GLOW_STYLE" > "$style"
+  if command -v glow >/dev/null 2>&1; then
+    bead_markdown "$id" | python3 -c "$PANE_FILTER" "$cols" keep-headings \
+      | glow -s "${BDBOARD_GLOW_STYLE:-$style}" -w "$((cols - 6))" -
+  else
+    bead_markdown "$id"
+  fi
+}
+
+# Reshape markdown for a narrow pane: first heading becomes H1, the next level
+# H2, deeper ones bold text; tables wider than the pane become one list item per row.
+read -r -d '' PANE_FILTER <<'PY'
+import re, sys
+cols = int(sys.argv[1]) if len(sys.argv) > 1 else 80
+max_heading = 6 if len(sys.argv) > 2 and sys.argv[2] == "keep-headings" else 2
+lines = sys.stdin.read().split("\n")
+levels = [len(m.group(1)) for l in lines for m in [re.match(r"^(#{1,6}) ", l)] if m]
+out, first, i = [], True, 0
+base = min(levels[1:]) if len(levels) > 1 else (levels[0] if levels else 1)
+def cells(row):
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+while i < len(lines):
+    l = lines[i]
+    m = re.match(r"^(#{1,6}) (.*)", l)
+    if m:
+        lvl = 1 if first else max(2, len(m.group(1)) - base + 2)
+        first = False
+        # mdfried draws headings as images; there keep only H1/H2 as headings.
+        out.append("#" * lvl + " " + m.group(2) if lvl <= max_heading else "**" + m.group(2) + "**")
+        i += 1; continue
+    if l.lstrip().startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]:
+        j = i + 2
+        while j < len(lines) and lines[j].lstrip().startswith("|"):
+            j += 1
+        head, rows = cells(l), [cells(r) for r in lines[i + 2:j]]
+        width = sum(max(len(c) for c in col) for col in zip(head, *rows)) + 3 * len(head) + 1
+        if width <= cols:
+            out.extend(lines[i:j])
+        else:
+            for r in rows:
+                r = r + [""] * (len(head) - len(r))
+                short = [f"{h}: **{v}**" for h, v in zip(head[1:], r[1:]) if v and len(v) <= 12]
+                long = [f"{h}: {v}" for h, v in zip(head[1:], r[1:]) if v and len(v) > 12]
+                item = ["**" + r[0] + "**"] + ([" · ".join(short)] if short else []) + long
+                out.append("- " + "  \n  ".join(item))
+            out.append("")
+        i = j; continue
+    out.append(l); i += 1
+print("\n".join(out))
+PY
+
+show_markdown() {
+  local f
+  f="$(mktemp)"
+  python3 -c "$PANE_FILTER" "$(tput cols 2>/dev/null || echo 80)" < "$1" > "$f" || cp "$1" "$f"
+  if command -v mdfried >/dev/null 2>&1; then
+    mdfried "$f"
+  elif command -v glow >/dev/null 2>&1; then
+    glow -p "$f"
+  else
+    less -R "$f"
+  fi
+  rm -f "$f"
+}
+
+# ---------------------------------------------------------------- explain
+#
+# In tmux, enter starts the explanation in the background; a spinner runs in
+# the board's header and the explanation opens in its own tmux window when it
+# is ready. Own window, because inside fzf's pane mdfried's terminal queries
+# race fzf and the replies leak in as keystrokes. Outside tmux it runs in the
+# foreground.
+
+read -r -d '' EXPLAIN_PROMPT <<'TXT'
+Explain beads (bd) issue {ID} to someone who is not an engineer, so they can
+decide whether to start it. This is read-only: do not edit files and do not
+change any bd state.
+
+Gather:
+- bd show {ID} --json, and bd show <parent> --json if it has a parent
+- bd dep list {ID} --json (what it waits on) and
+  bd dep list {ID} --direction up --json (what it unblocks)
+- if it has a parent: bd list --parent <parent> --status all --limit 0 --json
+  (siblings: what is done, what is left)
+- skim the code or docs the bead names, or find them by its key terms, so
+  the risks reflect the real codebase and not just the ticket text
+
+Rules:
+- Define each technical term inline, in a few plain words, on first use.
+- Every claim must trace to the bead, its parent, its dependencies or code
+  you read. Mark inferences as inferences.
+- At most 500 words, not counting the risk table. No emojis in tables.
+
+Reply with only this markdown:
+
+# {ID}: <title>
+
+## What it is
+Two or three sentences: the problem, in everyday terms.
+
+## What it delivers
+Bullets: what someone could see, click or run afterwards that they cannot
+today.
+
+## Why now
+What it unblocks and what it depends on (and whether those are done), how
+far along its parent is (N of M children done), or plainly that nothing
+makes it urgent.
+
+## Risks
+| Risk | Likelihood | Impact | Mitigation |
+Low / Medium / High. Cover blast radius, reversibility (data, migrations,
+outside services), unknowns (vague or stale ticket text) and review size.
+
+## Before you start
+One to three bullets of questions worth answering first, or "Nothing
+blocking."
+TXT
+
+cache_path() { # dir id
+  local updated
+  updated="$(cd "$1" && bd show "$2" --json 2>/dev/null \
+    | jq -r '(if type == "array" then .[0] else . end).updated_at // "x"' | tr -dc '0-9A-Za-z')"
+  echo "$CACHE_ROOT/$(echo "$1" | tr '/' '_')/$2@$updated.md"
+}
+
+run_claude() { # dir id out err
+  local prompt
+  if [ -f "$1/.claude/commands/explain-bead.md" ]; then
+    prompt="/explain-bead $2"   # the project's own command wins
+  else
+    prompt="${EXPLAIN_PROMPT//\{ID\}/$2}"
+  fi
+  (cd "$1" && claude -p "$prompt" --no-session-persistence \
+    --allowedTools 'Bash(bd show:*)' 'Bash(bd dep list:*)' 'Bash(bd list:*)' \
+                   'Bash(git log:*)' 'Bash(git branch:*)' Read Grep Glob \
+    --disallowedTools Edit Write NotebookEdit \
+    >"$3" 2>"$4") && [ -s "$3" ]
+}
+
+save_cache() { # tmp cache
+  mkdir -p "$(dirname "$2")"
+  rm -f "${2%@*}@"*.md
+  mv "$1" "$2"
+}
+
+explain_bead() { # id [force]
+  local id="$1" force="$2" dir cache
+  [ "$id" = "-" ] || [ -z "$id" ] && return
+  dir="$(project)"
+  cache="$(cache_path "$dir" "$id")"
+  if [ "$force" != "force" ] && [ -s "$cache" ]; then
+    show_window "$dir" "$id" "$cache"
+  elif ! command -v claude >/dev/null 2>&1; then
+    notify "bdboard: explanations need the claude CLI (https://claude.com/claude-code)"
+  elif [ -n "$TMUX" ]; then
+    mkdir -p "$BDBOARD_STATE/pending"
+    [ -e "$BDBOARD_STATE/pending/$id" ] && return
+    : > "$BDBOARD_STATE/pending/$id"
+    # Run under the tmux server so it outlives fzf's execute-silent.
+    tmux run-shell -b "$(printf 'BDBOARD_STATE=%q PATH=%q %q __generate %q %q %q %q >/dev/null 2>>%q' \
+      "$BDBOARD_STATE" "$PATH" "$SELF" "$dir" "$id" "$cache" "$(board_session)" \
+      "$BDBOARD_STATE/generate.log")"
+  else
+    local tmp
+    tmp="$(mktemp)"
+    printf '\033[1mExplaining %s with Claude\033[0m (usually under a minute; cached afterwards)\n' "$id"
+    if run_claude "$dir" "$id" "$tmp" "$tmp.err"; then
+      save_cache "$tmp" "$cache"; rm -f "$tmp.err"
+      show_markdown "$cache"
+    else
+      cat "$tmp" "$tmp.err"; rm -f "$tmp" "$tmp.err"
+      printf '\nPress any key...'; read -rsn1
+    fi
+  fi
+}
+
+notify() {
+  if [ -n "$TMUX" ]; then
+    tmux display-message -d 5000 "$1"
+  else
+    printf '%s\nPress any key...' "$1"; read -rsn1
+  fi
+}
+
+# The tmux session the board runs in. Background jobs run under the tmux server,
+# where an untargeted new-window would land in whichever session was used last.
+board_session() {
+  tmux display-message -p -t "${TMUX_PANE:-}" '#{session_id}' 2>/dev/null
+}
+
+show_window() { # dir id file [session]
+  if [ -n "$TMUX" ]; then
+    tmux new-window -t "${4:-$(board_session)}:" -n "$2" -c "$1" "$SELF __show $(printf '%q' "$3")"
+  else
+    show_markdown "$3"
+  fi
+}
+
+post() { # fzf action, sent to the board over its --listen port
+  local port
+  port="$(cat "$BDBOARD_STATE/port" 2>/dev/null)" || return
+  curl -s -XPOST "localhost:$port" -d "$1" >/dev/null 2>&1
+}
+
+generate() { # dir id cache session  (background, BDBOARD_STATE inherited)
+  local dir="$1" id="$2" cache="$3" session="$4" tmp i=0
+  tmp="$(mktemp)"
+  run_claude "$dir" "$id" "$tmp" "$tmp.err" &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    post "change-header:$(header_text "$i")"; i=$((i + 1)); sleep 0.25
+  done
+  if wait "$pid"; then
+    save_cache "$tmp" "$cache"; rm -f "$tmp.err" "$BDBOARD_STATE/pending/$id"
+    post "change-header:$(header_text)"
+    show_window "$dir" "$id" "$cache" "$session"
+  else
+    rm -f "$BDBOARD_STATE/pending/$id"
+    post "change-header:$(header_text)"
+    notify "bdboard: explaining $id failed: $(head -c 200 "$tmp.err" "$tmp" | tr '\n' ' ')"
+    rm -f "$tmp" "$tmp.err"
+  fi
+}
+
+# ---------------------------------------------------------------- main
+
+case "$1" in
+  __list) list_beads; exit ;;
+  __preview) preview_bead "$2"; exit ;;
+  __explain) explain_bead "$2" "$3"; exit ;;
+  __generate) generate "$2" "$3" "$4" "$5"; exit ;;
+  __show) show_markdown "$2"; exit ;;
+  __header) header_text; exit ;;
+  __pick)
+    p="$(pick_project)"; [ -n "$p" ] && echo "$p" > "$(project_file)" && remember_project "$p"; exit ;;
+esac
+
+for tool in bd jq fzf curl python3; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required but not installed."
+done
+fzf_version="$(fzf --version | sed 's/[^0-9.].*//')"
+[ "$(printf '0.51\n%s\n' "$fzf_version" | sort -t. -k1,1n -k2,2n | head -1)" = "0.51" ] \
+  || die "fzf 0.51 or newer is required (found $fzf_version)."
+
+proj="" pick=0 split=0 args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) proj="$2"; args+=(-p "$2"); shift 2 ;;
+    --pick) pick=1; args+=(--pick); shift ;;
+    --split) split=1; shift ;;
+    -h|--help) sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; exit ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+if [ "$split" = 1 ]; then
+  [ -n "$TMUX" ] || die "--split needs to run inside tmux"
+  exec tmux split-window -h -l "${BDBOARD_WIDTH:-45%}" -c "$PWD" "$SELF ${args[*]}"
+fi
+
+export BDBOARD_STATE="$(mktemp -d)"
+refresher=""
+trap '[ -n "$refresher" ] && kill "$refresher" 2>/dev/null; rm -rf "$BDBOARD_STATE"' EXIT
+
+if [ -n "$proj" ]; then
+  proj="$(cd "$proj" 2>/dev/null && pwd)" || die "no such directory: $proj"
+  [ -d "$proj/.beads" ] || die "not a beads project: $proj"
+elif [ "$pick" = 0 ]; then
+  proj="$(detect_project)"
+fi
+[ -n "$proj" ] || proj="$(pick_project)"
+[ -n "$proj" ] || exit 0
+echo "$proj" > "$(project_file)"
+remember_project "$proj"
+
+interval="${BDBOARD_REFRESH:-10}"
+if [ "$interval" -gt 0 ] 2>/dev/null; then
+  (
+    port_file="$BDBOARD_STATE/port"
+    while [ ! -s "$port_file" ]; do sleep 0.2; done
+    port="$(cat "$port_file")"
+    while sleep "$interval"; do
+      curl -s -XPOST "localhost:$port" -d "reload($SELF __list)" >/dev/null 2>&1 || exit 0
+    done
+  ) &
+  refresher=$!
+fi
+
+run=execute; [ -n "$TMUX" ] && run=execute-silent
+
+# Detail mode (tab): vim-style keys scroll the detail pane instead of typing.
+in_detail='[ "$FZF_PROMPT" = "detail> " ]'
+to_detail='change-prompt(detail> )+disable-search+change-preview-label( j/k line  d/u half page  g/G top/bottom  esc back )'
+to_list='change-prompt(filter> )+enable-search+change-preview-label()'
+detail_key() { # key, action in detail mode, action in the list
+  printf -- '--bind=%s:transform:%s && echo %q || echo %q' "$1" "$in_detail" "$2" "$3"
+}
+
+"$SELF" __list | fzf --ansi --layout=reverse --no-sort --track --listen \
+  --with-shell='bash -c' \
+  --delimiter='\t' --with-nth=2.. \
+  --header="$(header_text)" --prompt='filter> ' --info=inline \
+  --preview="$SELF __preview {1}" --preview-window='down,55%,border-top' \
+  --bind="start:execute-silent(echo \$FZF_PORT > $BDBOARD_STATE/port)" \
+  --bind="enter:$run($SELF __explain {1})" \
+  --bind="ctrl-e:$run($SELF __explain {1} force)" \
+  --bind="ctrl-r:reload($SELF __list)" \
+  --bind="ctrl-p:execute($SELF __pick)+reload($SELF __list)+transform-header($SELF __header)" \
+  --bind="tab:transform:$in_detail && echo '$to_list' || echo '$to_detail'" \
+  "$(detail_key esc "$to_list" abort)" \
+  "$(detail_key j preview-down 'put(j)')" \
+  "$(detail_key k preview-up 'put(k)')" \
+  "$(detail_key d preview-half-page-down 'put(d)')" \
+  "$(detail_key u preview-half-page-up 'put(u)')" \
+  "$(detail_key g preview-top 'put(g)')" \
+  "$(detail_key G preview-bottom 'put(G)')" \
+  --bind='ctrl-d:preview-half-page-down,ctrl-u:preview-half-page-up'
