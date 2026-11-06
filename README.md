@@ -105,8 +105,8 @@ The list is split into sections:
 
 | Section | Beads in it |
 |---|---|
-| UP NEXT | Open, with nothing blocking them |
 | IN PROCESS | Claimed (`in_progress`) and not yet delivered |
+| UP NEXT | Open, with nothing blocking them |
 | DELIVERED | In progress and carrying a delivered label, so waiting on a merge (see below) |
 | BLOCKED | Open, and waiting on another bead; shows which |
 | DONE | Closed, newest first |

@@ -2,8 +2,8 @@
 #
 # bdboard - interactive beads (bd) board for a tmux pane
 #
-# Sections: UP NEXT (open, nothing blocking), IN PROCESS (claimed, not yet
-# delivered), DELIVERED (in progress with a delivered label, awaiting merge),
+# Sections: IN PROCESS (claimed, not yet delivered), UP NEXT (open, nothing
+# blocking), DELIVERED (in progress with a delivered label, awaiting merge),
 # BLOCKED (open, waiting on another bead), DONE (closed).
 #
 # Keys: up/down move, type to filter, enter = plain-language explanation
@@ -119,11 +119,11 @@ list_beads() {
     | ([ .[] | select(.status == "in_progress" and (delivered | not)) ] | byprio) as $wip
     | ([ .[] | select(.status == "in_progress" and delivered) ] | byprio) as $dlv
     | ([ .[] | select(.status == "closed") ] | sort_by(.closed_at // .updated_at) | reverse) as $done
-    | head("36"; "UP NEXT  ready to start"; ($next | length)),
-      ($next[] | row(labels | map(select(startswith("effort:"))) | join(" "))),
-      "-\t",
-      head("33"; "IN PROCESS"; ($wip | length)),
+    | head("33"; "IN PROCESS"; ($wip | length)),
       ($wip[] | row(.assignee // "")),
+      "-\t",
+      head("36"; "UP NEXT  ready to start"; ($next | length)),
+      ($next[] | row(labels | map(select(startswith("effort:"))) | join(" "))),
       "-\t",
       head("34"; "DELIVERED  awaiting merge"; ($dlv | length)),
       ($dlv[] | row(refs)),
@@ -292,8 +292,8 @@ PY
 preview_bead() {
   local id="$1"
   if [ "$id" = "-" ] || [ -z "$id" ]; then
-    printf 'UP NEXT     open, nothing blocking it\n'
     printf 'IN PROCESS  claimed and being worked, not yet delivered\n'
+    printf 'UP NEXT     open, nothing blocking it\n'
     printf 'DELIVERED   in progress with a delivered label: %s\n' "${BDBOARD_DELIVERED_LABELS:-committed,in-review}"
     printf 'BLOCKED     open, waiting on a bead that is not closed or delivered\n'
     printf 'DONE        closed\n\nenter: plain-language explanation (full screen)\n'
