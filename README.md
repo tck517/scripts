@@ -135,7 +135,7 @@ Enter asks [Claude Code](https://claude.com/claude-code) (`claude -p`) to explai
 
 - It runs read-only: Claude may only run `bd show`, `bd dep list`, `bd list`, `git log`, `git branch` and read files. It cannot edit files or change beads.
 - In tmux it runs in the background with a spinner in the board's header, then opens in its own tmux window when ready (`q` closes it). Outside tmux you wait for it.
-- It is cached in `~/.cache/bdboard` until the bead changes. Anything that updates the bead (a note, label or status) makes the next enter ask again.
+- It is cached in `~/.cache/bdboard` until the bead or the explainer changes. Anything that updates the bead (a note, label or status), or any edit to the project's `.claude/commands/explain-bead.md` (or to bdboard's built-in prompt), makes the next enter ask again.
 - If the project has its own `.claude/commands/explain-bead.md`, that command is used instead of the built-in prompt.
 - Each explanation is a Claude call and uses your Claude plan or API credits.
 

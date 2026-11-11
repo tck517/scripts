@@ -7,7 +7,8 @@
 # BLOCKED (open, waiting on another bead), DONE (closed).
 #
 # Keys: up/down move, type to filter, enter = plain-language explanation
-# (Claude, cached, full screen in mdfried), ctrl-e = regenerate explanation,
+# (Claude, cached until the bead or the project's /explain-bead command
+# changes, full screen in mdfried), ctrl-e = regenerate explanation,
 # tab = detail mode (j/k, d/u, g/G scroll the detail pane; esc or tab back),
 # ctrl-d/ctrl-u = scroll detail, ctrl-p = switch project, ctrl-r = refresh now,
 # esc/ctrl-c = quit. The list auto-refreshes.
@@ -415,11 +416,21 @@ One to three bullets of questions worth answering first, or "Nothing
 blocking."
 TXT
 
+explainer_sum() { # dir  (checksum of whatever writes the explanation)
+  if [ -f "$1/.claude/commands/explain-bead.md" ]; then
+    cksum < "$1/.claude/commands/explain-bead.md"
+  else
+    printf '%s' "$EXPLAIN_PROMPT" | cksum
+  fi | cut -d' ' -f1
+}
+
+# Keyed on the bead's updated_at and the explainer's checksum, so editing
+# the bead or the project's /explain-bead command both regenerate.
 cache_path() { # dir id
   local updated
   updated="$(cd "$1" && bd show "$2" --json 2>/dev/null \
     | jq -r '(if type == "array" then .[0] else . end).updated_at // "x"' | tr -dc '0-9A-Za-z')"
-  echo "$CACHE_ROOT/$(echo "$1" | tr '/' '_')/$2@$updated.md"
+  echo "$CACHE_ROOT/$(echo "$1" | tr '/' '_')/$2@$updated-$(explainer_sum "$1").md"
 }
 
 run_claude() { # dir id out err
