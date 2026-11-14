@@ -1,3 +1,5 @@
+> **Moved:** these scripts now live in [`scripts/` in tck517/dev-tools](https://github.com/tck517/dev-tools/tree/main/scripts), with their history. This repo is archived.
+
 # scripts
 
 Small command-line tools, mostly shell.
