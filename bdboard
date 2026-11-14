@@ -600,8 +600,18 @@ run=execute; [ -n "$TMUX" ] && run=execute-silent
 
 # Detail mode (tab): vim-style keys scroll the detail pane instead of typing.
 in_detail='[ "$FZF_PROMPT" = "detail> " ]'
-to_detail='change-prompt(detail> )+disable-search+change-preview-label( j/k line  d/u half page  g/G top/bottom  esc back )'
-to_list='change-prompt(filter> )+enable-search+change-preview-label()'
+detail_help=' j/k line  d/u half page  g/G top/bottom  esc back '
+# Detail pane label names the selected bead, so it reads as linked to the
+# highlighted row (legend on section rows; scroll keys in detail mode).
+label_cmd="if $in_detail; then echo '$detail_help'; elif [ {1} = - ]; then echo ' legend '; else echo ' ▶ {1} '; fi"
+to_detail='change-prompt(detail> )+disable-search'
+to_list='change-prompt(filter> )+enable-search'
+# Switch mode, then refresh the label as its own action (nesting the label
+# command inside the transform's echo breaks its quoting).
+mode_key() { # key, action in the list
+  printf -- '--bind=%s:transform~%s && echo %q || echo %q~+transform-preview-label:%s' \
+    "$1" "$in_detail" "$to_list" "$2" "$label_cmd"
+}
 detail_key() { # key, action in detail mode, action in the list
   printf -- '--bind=%s:transform:%s && echo %q || echo %q' "$1" "$in_detail" "$2" "$3"
 }
@@ -609,15 +619,21 @@ detail_key() { # key, action in detail mode, action in the list
 "$SELF" __list | fzf --ansi --layout=reverse --no-sort --track --listen \
   --with-shell='bash -c' \
   --delimiter='\t' --with-nth=2.. \
-  --header="$(header_text)" --prompt='filter> ' --info=inline \
-  --preview="$SELF __preview {1}" --preview-window='down,55%,border-top' \
+  --header="$(header_text)" --prompt='filter> ' --info=inline-right \
+  --input-border=rounded \
+  --list-border=rounded --list-label=' beads ' \
+  --preview="$SELF __preview {1}" --preview-window='down,55%,border-rounded' \
+  --highlight-line --pointer='▶' --gutter=' ' \
+  --color='border:238,label:245,bg+:236,gutter:-1,pointer:141:bold' \
+  --color='preview-border:141,preview-label:141:bold' \
+  --bind="focus:transform-preview-label:$label_cmd" \
   --bind="start:execute-silent(echo \$FZF_PORT > $BDBOARD_STATE/port)" \
   --bind="enter:$run($SELF __explain {1})" \
   --bind="ctrl-e:$run($SELF __explain {1} force)" \
   --bind="ctrl-r:reload($SELF __list)" \
   --bind="ctrl-p:execute($SELF __pick)+reload($SELF __list)+transform-header($SELF __header)" \
-  --bind="tab:transform:$in_detail && echo '$to_list' || echo '$to_detail'" \
-  "$(detail_key esc "$to_list" abort)" \
+  "$(mode_key tab "$to_detail")" \
+  "$(mode_key esc abort)" \
   "$(detail_key j preview-down 'put(j)')" \
   "$(detail_key k preview-up 'put(k)')" \
   "$(detail_key d preview-half-page-down 'put(d)')" \
